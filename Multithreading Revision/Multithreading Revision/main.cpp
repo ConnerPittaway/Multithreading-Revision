@@ -12,11 +12,10 @@
 
 constexpr size_t DATASET_SIZE = 50'000'000;
 
-void ProcessData(std::array<int, DATASET_SIZE>& set, int &sum, std::mutex &mtx)
+void ProcessData(std::array<int, DATASET_SIZE>& set, int &sum)
 {
 	for (int x : set)
 	{
-		std::lock_guard g{ mtx };
 		constexpr auto limit = (double)std::numeric_limits<int>::max();
 		const auto y = (double)x / limit;
 		sum += int(std::sin(std::cos(y)) * limit);
@@ -36,14 +35,19 @@ int main()
 		std::ranges::generate(arr, rne);
 	}
 
-	int sum = 0;
+	struct Value
+	{
+		int v = 0;
+		char padding[60]; //Padding to fit on new cache line to avoid syncronisation
+	};
+	Value sum[4] = {0, 0, 0, 0};
 	
 	std::mutex mtx;
 	timer.Mark();
 	//Create threads
-	for (auto& set : datasets)
+	for (size_t i = 0; i < 4; i++)
 	{
-		workers.push_back(std::thread{ ProcessData, std::ref(set), std::ref(sum), std::ref(mtx)});
+		workers.push_back(std::thread{ ProcessData, std::ref(datasets[i]), std::ref(sum[i].v)});
 	}
 
 	//Join threads back to main
@@ -53,6 +57,7 @@ int main()
 	}
 	auto t = timer.Peek();
 
+	std::cout << "Result is " << sum[0] + sum[1] + sum[2] + sum[3] << std::endl;
 	std::cout << "Processing the datasets took " << t << " seconds\n";
 	return 0;
 }
