@@ -2,94 +2,82 @@
 #include <vector>
 #include <array>
 #include <random>
-#include <ranges>
-#include <limits>
-#include <cmath>
 #include <thread>
 #include <mutex>
 #include <span>
+#include <algorithm>
+#include <numeric>
 
 #include "Timer.h"
 
-constexpr size_t DATASET_SIZE = 50'000'000;
+constexpr size_t WorkerCount = 4;
+constexpr size_t ChunkSize = 1000;
+constexpr size_t ChunkCount = 100;
+constexpr size_t SubsetSize = ChunkSize / WorkerCount;
+constexpr size_t LightIterations = 100;
+constexpr size_t HeavyIterations = 1'000;
 
-void ProcessData(std::span<int> set, int &sum)
+constexpr double ProbabilityHeavy = .02;
+
+static_assert(ChunkSize >= WorkerCount);
+static_assert(ChunkSize% WorkerCount == 0);
+
+struct Task
 {
-	for (int x : set)
+	unsigned int val;
+	bool heavy;
+	unsigned int Process() const
 	{
-		constexpr auto limit = (double)std::numeric_limits<int>::max();
-		const auto y = (double)x / limit;
-		sum += int(std::sin(std::cos(y)) * limit);
-	}
-}
-
-std::vector<std::array<int, DATASET_SIZE>> GenerateData()
-{
-	std::minstd_rand rne;
-	std::vector<std::array<int, DATASET_SIZE>> datasets{ 4 };
-
-	//Generate Random Numbers
-	for (auto& arr : datasets)
-	{
-		std::ranges::generate(arr, rne);
-	}
-
-	return datasets;
-}
-
-int Big()
-{
-	auto datasets = GenerateData();
-
-	std::vector<std::thread> workers;
-	Timer timer;
-
-	struct Value
-	{
-		int v = 0;
-		char padding[60]; //Padding to fit on new cache line to avoid syncronisation
+		const auto iterations = heavy ? HeavyIterations : LightIterations;
+		double intermediate = 2. * (double(val) / double(std::numeric_limits<unsigned int>::max())) - 1.;
+		for (size_t i = 0; i < iterations; i++)
+		{
+			intermediate = std::sin(std::cos(intermediate));
+		}
+		return unsigned int((intermediate + 1.) / 2. * double(std::numeric_limits<unsigned int>::max()));
 	};
-	Value sum[4] = {0, 0, 0, 0};
-	
-	timer.Mark();
-	//Create threads
-	for (size_t i = 0; i < 4; i++)
+};
+
+std::vector<std::array<Task, ChunkSize>> GenerateData()
+{
+	std::minstd_rand rne; //Random Number Engine 
+	std::bernoulli_distribution hDist{ ProbabilityHeavy }; //Heavy Distribution
+
+	std::vector<std::array<Task, ChunkSize>> chunks(ChunkCount);
+	for (auto& chunk : chunks)
 	{
-		workers.push_back(std::thread{ ProcessData, std::span(datasets[i]), std::ref(sum[i].v)});
+		std::ranges::generate(chunk, [&] {return Task{ .val = rne(), .heavy = hDist(rne) }; });
 	}
 
-	//Join threads back to main
-	for (auto& w : workers)
-	{
-		w.join();
-	}
-	auto t = timer.Peek();
-
-	std::cout << "Result is " << sum[0].v + sum[1].v + sum[2].v + sum[3].v << std::endl;
-	std::cout << "Processing the datasets took " << t << " seconds\n";
-	return 0;
+	return chunks;
 }
 
 class WorkerController
 {
 public:
-	WorkerController(int workerCount) : lk{ mtx }, workerCount{ workerCount } {}
+	WorkerController() : lk{ mtx } {}
 	void SignalDone()
 	{
 		bool needsNotification = false;
 		{
 			std::lock_guard lk{ mtx };
 			++doneCount;
-			if (doneCount == workerCount)
+			if (doneCount == WorkerCount)
 			{
-				cv.notify_one();
+				needsNotification = true;
+
 			}
+		}
+
+		if (needsNotification)
+		{
+			cv.notify_one();
 		}
 	}
 
 	void WaitForAllDone()
 	{
-		cv.wait(lk, [this] {return doneCount == workerCount; });
+		cv.wait(lk, [this] {return doneCount == WorkerCount; });
 		doneCount = 0;
 	}
 
@@ -97,7 +85,6 @@ private:
 	std::condition_variable cv;
 	std::mutex mtx; //Always Mutex with CV
 	std::unique_lock<std::mutex> lk;
-	int workerCount = 0;
 
 	//Shared Memory
 	int doneCount = 0;
@@ -112,12 +99,11 @@ public:
 		thread{ &Worker::Run_, this }
 	{}
 
-	void SetJob(std::span<int> data, int *pOut)
+	void SetJob(std::span<const Task> data)
 	{
 		{
 			std::lock_guard lk{ mtx };
 			input = data;
-			pOutput = pOut;
 		}
 		cv.notify_one();
 	}
@@ -131,83 +117,123 @@ public:
 		cv.notify_one();
 	}
 
+	unsigned int GetResult() const
+	{
+		return accululation;
+	}
+
 private:
+	void ProcessData_()
+	{
+		for (const auto& task : input)
+		{
+			accululation += task.Process();
+		}
+	}
 
 	void Run_()
 	{
 		std::unique_lock lk{ mtx };
 		while (true)
 		{
-			cv.wait(lk, [this] {return pOutput !=nullptr || terminate; });
+			cv.wait(lk, [this] {return !input.empty() || terminate; });
 			if (terminate)
 			{
 				break;
 			}
-			ProcessData(input, *pOutput);
-			pOutput = nullptr;
+			ProcessData_();
 			input = {};
 			pController->SignalDone();
 		}
 	}
-
 	WorkerController* pController;
 	std::jthread thread;
 	std::condition_variable cv;
 	std::mutex mtx;
 
 	//Shared Memory
-	std::span<int> input;
-	int* pOutput = nullptr;
+	std::span<const Task>input;
+	unsigned int accululation = 0;
 	bool terminate = false;
 };
 
-int Small()
+int Experiment()
 {
-	auto datasets = GenerateData();
-
-	struct Value
-	{
-		int v = 0;
-		char padding[60]; //Padding to fit on new cache line to avoid syncronisation
-	};
-	Value sum[4];
+	const auto chunks = GenerateData();
 
 	Timer timer;
 	timer.Mark();
 
 	//Create Worker Threads
-	constexpr size_t workerCount = 4;
-	WorkerController workerController{ workerCount }; // Initialise Controller
+	WorkerController workerController; //Initialise Controller
 	std::vector<std::unique_ptr<Worker>> workerPtrs;
-	for (size_t i = 0; i < workerCount; i++)
+	for (size_t i = 0; i < WorkerCount; i++)
 	{
 		workerPtrs.push_back(std::make_unique<Worker>(&workerController));
 	}
 
-	const auto subsetSize = DATASET_SIZE / 10'000;
-	for (size_t i = 0; i < DATASET_SIZE; i += subsetSize)
+	for (const auto& chunk : chunks)
 	{
-		for (size_t j = 0; j < 4; j++)
+		for (size_t iSubset = 0; iSubset < WorkerCount; iSubset++)
 		{
-			workerPtrs[j]->SetJob(std::span(&datasets[j][i], subsetSize), &sum[j].v);
-			//workers.push_back(std::jthread{ ProcessData, std::span(&datasets[j][i], subsetSize), std::ref(sum[j].v)});
+			workerPtrs[iSubset]->SetJob(std::span{ &chunk[iSubset * SubsetSize], SubsetSize });
+			//workerThreads.push_back(std::jthread{ ProcessData, std::span{&datasets[j][i], subsetSize}, std::ref(sum[j].i)});
 		}
 		workerController.WaitForAllDone();
 	}
+
 	auto t = timer.Peek();
-
-	std::cout << "Result is " << sum[0].v + sum[1].v + sum[2].v + sum[3].v << std::endl;
-	std::cout << "Processing the datasets took " << t << " seconds\n";
-
-	for (auto& w : workerPtrs)
+	std::cout << "Processing took " << t << " seconds\n";
+	unsigned int result = 0;
+	for (const auto& w : workerPtrs)
 	{
-		w->Kill();
+		result += w->GetResult();
+	}
+	std::cout << "Result is " << result << std::endl;
+
+	return 0;
+}
+
+
+/*struct Value
+{
+	int i = 0;
+	char padding[60]; //Padding to avoid syncronisation
+};
+Value sum[4];*/
+
+int DoBig()
+{
+	auto datasets = GenerateData();
+
+	std::vector<std::thread> workerThreads;
+	Timer timer;
+
+	struct Value
+	{
+		int i = 0;
+		char padding[60]; //Padding to avoid syncronisation
+	};
+	Value sum[4];
+
+	timer.Mark();
+	for (size_t i = 0; i < 4; i++)
+	{
+		//workerThreads.push_back(std::thread{ ProcessData, std::span{datasets[i]}, std::ref(sum[i].i) });
 	}
 
+	for (auto& wt : workerThreads)
+	{
+		wt.join();
+	}
+	auto t = timer.Peek();
+
+	std::cout << "Set generation took " << t << " seconds\n";
+	std::cout << "Result is " << sum[0].i + sum[1].i + sum[2].i + sum[3].i << std::endl;
 	return 0;
 }
 
 int main(int argc, char** argv)
 {
-	return Small();
+	return Experiment();
 }
