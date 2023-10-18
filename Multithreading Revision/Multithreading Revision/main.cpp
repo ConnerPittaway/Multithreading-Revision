@@ -10,20 +10,21 @@
 #include <numbers>
 #include <fstream>
 #include <format>
+#include <functional>
 
 #include "Timer.h"
 
 constexpr size_t WorkerCount = 4;
-constexpr size_t ChunkSize = 100;
+constexpr size_t ChunkSize = 8'000;
 constexpr size_t ChunkCount = 100;
 constexpr size_t SubsetSize = ChunkSize / WorkerCount;
 constexpr size_t LightIterations = 100;
 constexpr size_t HeavyIterations = 1'000;
 
-constexpr double ProbabilityHeavy = .02;
+constexpr double ProbabilityHeavy = .05;
 
 static_assert(ChunkSize >= WorkerCount);
-static_assert(ChunkSize% WorkerCount == 0);
+static_assert(ChunkSize % WorkerCount == 0);
 
 struct Task
 {
@@ -49,7 +50,7 @@ struct ChunkTimeInfo
 	float totalChunkTime;
 };
 
-std::vector<std::array<Task, ChunkSize>> GenerateData()
+std::vector<std::array<Task, ChunkSize>> GenerateDataRandom()
 {
 	std::minstd_rand rne; //Random Number Engine 
 	std::bernoulli_distribution hDist{ ProbabilityHeavy }; //Heavy Distribution
@@ -63,6 +64,39 @@ std::vector<std::array<Task, ChunkSize>> GenerateData()
 	}
 
 	return chunks;
+}
+
+std::vector<std::array<Task, ChunkSize>> GenerateDataEvenly()
+{
+	std::minstd_rand rne; //Random Number Engine 
+	
+	std::uniform_real_distribution rDist{ 0., std::numbers::pi };
+
+	const int everyNth = int(1. / ProbabilityHeavy);
+
+	std::vector<std::array<Task, ChunkSize>> chunks(ChunkCount);
+
+	for (auto& chunk : chunks)
+	{
+		std::ranges::generate(chunk, [&, i = 0]() mutable {
+			const auto isHeavy = i++ % everyNth == 0;
+			return Task{ .val = rDist(rne), .heavy = isHeavy }; });
+	}
+
+	return chunks;
+}
+
+std::vector<std::array<Task, ChunkSize>> GenerateDataStacked()
+{
+	auto data = GenerateDataEvenly();
+
+	for (auto& chunk : data)
+	{
+		std::ranges::partition(chunk, std::identity{}, &Task::heavy);
+	}
+
+
+	return data;
 }
 
 class WorkerController
@@ -194,9 +228,19 @@ private:
 	size_t numHeavyItems;
 };
 
-int Experiment()
+int Experiment(bool stacked)
 {
-	const auto chunks = GenerateData();
+	const auto chunks = [=]
+	{
+		if (stacked)
+		{
+			return GenerateDataStacked();
+		}
+		else
+		{
+			return GenerateDataEvenly();
+		}
+	}();
 
 	Timer totalTime;
 	totalTime.Mark();
@@ -245,30 +289,34 @@ int Experiment()
 
 	//Output CSV of timings
 	// work-time, idle-time, number of heavies x workers + total time, total heavies
-	std::ofstream csv{ "timings.csv" };
+	std::ofstream csv{ "timings.csv", std::ios_base::trunc };
 	for (size_t i = 0; i < WorkerCount; i++)
 	{
 		csv << std::format("work_{0:}, idle_{0:}, heavy_{0:}, ", i);
 	}
-	csv << "chunk_time, total_heavy\n";
-	return 0;
+	csv << "chunk_time, total_idle, total_heavy\n";
 
 	for (const auto& chunk : timings)
 	{
+		float totalIdle = 0.f;
+		size_t totalHeavy = 0;
 		for (size_t i = 0; i < WorkerCount; i++)
 		{
-			csv << std::format("{},{},{},", 
-				chunk.timeSpentWorkingPerThread[i], 
-				chunk.totalChunkTime - chunk.timeSpentWorkingPerThread[i],
-				chunk.numberOfHeavyPerThread[i]);
+			const auto idle = chunk.totalChunkTime - chunk.timeSpentWorkingPerThread[i];
+			const auto heavy = chunk.numberOfHeavyPerThread[i];
+			csv << std::format("{},{},{},", chunk.timeSpentWorkingPerThread[i], idle,heavy);
+			totalIdle += idle;
+			totalHeavy += heavy;
 		}
-		csv << std::format("{},{}", chunk.totalChunkTime, std::accumulate(std::begin(chunk.numberOfHeavyPerThread), std::end(chunk.numberOfHeavyPerThread), 0));
+		csv << std::format("{},{},{}\n", chunk.totalChunkTime, totalIdle, totalHeavy);
 	}
+
+	return 0;
 }
 
 int DoBig()
 {
-	auto datasets = GenerateData();
+	auto datasets = GenerateDataRandom();
 
 	std::vector<std::thread> workerThreads;
 	Timer timer;
@@ -299,5 +347,5 @@ int DoBig()
 
 int main(int argc, char** argv)
 {
-	return Experiment();
+	return Experiment(true);
 }
