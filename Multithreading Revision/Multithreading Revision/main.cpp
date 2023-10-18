@@ -7,11 +7,14 @@
 #include <span>
 #include <algorithm>
 #include <numeric>
+#include <numbers>
+#include <fstream>
+#include <format>
 
 #include "Timer.h"
 
 constexpr size_t WorkerCount = 4;
-constexpr size_t ChunkSize = 1000;
+constexpr size_t ChunkSize = 100;
 constexpr size_t ChunkCount = 100;
 constexpr size_t SubsetSize = ChunkSize / WorkerCount;
 constexpr size_t LightIterations = 100;
@@ -24,29 +27,39 @@ static_assert(ChunkSize% WorkerCount == 0);
 
 struct Task
 {
-	unsigned int val;
+	double val;
 	bool heavy;
 	unsigned int Process() const
 	{
 		const auto iterations = heavy ? HeavyIterations : LightIterations;
-		double intermediate = 2. * (double(val) / double(std::numeric_limits<unsigned int>::max())) - 1.;
+		auto intermediate = val;
 		for (size_t i = 0; i < iterations; i++)
 		{
-			intermediate = std::sin(std::cos(intermediate));
+			const auto digits = unsigned int(std::abs(std::sin(std::cos(intermediate)) * 10'000'000.)) % 100'000;
+			intermediate = double(digits) / 10'000.; //Value between 0 and 10;
 		}
-		return unsigned int((intermediate + 1.) / 2. * double(std::numeric_limits<unsigned int>::max()));
+		return unsigned int(std::exp(intermediate));
 	};
+};
+
+struct ChunkTimeInfo
+{
+	std::array<float, WorkerCount> timeSpentWorkingPerThread;
+	std::array<size_t, WorkerCount> numberOfHeavyPerThread;
+	float totalChunkTime;
 };
 
 std::vector<std::array<Task, ChunkSize>> GenerateData()
 {
 	std::minstd_rand rne; //Random Number Engine 
 	std::bernoulli_distribution hDist{ ProbabilityHeavy }; //Heavy Distribution
+	std::uniform_real_distribution rDist{ 0., std::numbers::pi };
 
 	std::vector<std::array<Task, ChunkSize>> chunks(ChunkCount);
+
 	for (auto& chunk : chunks)
 	{
-		std::ranges::generate(chunk, [&] {return Task{ .val = rne(), .heavy = hDist(rne) }; });
+		std::ranges::generate(chunk, [&] {return Task{ .val = rDist(rne), .heavy = hDist(rne) }; });
 	}
 
 	return chunks;
@@ -122,12 +135,29 @@ public:
 		return accululation;
 	}
 
+	float GetJobWorkTime() const
+	{
+		return workTime;
+	}
+
+	size_t GetNumHeavy() const
+	{
+		return numHeavyItems;
+	}
+
+	~Worker()
+	{
+		Kill();
+	}
+
 private:
 	void ProcessData_()
 	{
+		numHeavyItems = 0;
 		for (const auto& task : input)
 		{
 			accululation += task.Process();
+			numHeavyItems += task.heavy;
 		}
 	}
 
@@ -136,12 +166,17 @@ private:
 		std::unique_lock lk{ mtx };
 		while (true)
 		{
+			Timer timer;
 			cv.wait(lk, [this] {return !input.empty() || terminate; });
 			if (terminate)
 			{
 				break;
 			}
+
+			timer.Mark();
 			ProcessData_();
+			workTime = timer.Peek();
+
 			input = {};
 			pController->SignalDone();
 		}
@@ -155,14 +190,16 @@ private:
 	std::span<const Task>input;
 	unsigned int accululation = 0;
 	bool terminate = false;
+	float workTime = -1.f;
+	size_t numHeavyItems;
 };
 
 int Experiment()
 {
 	const auto chunks = GenerateData();
 
-	Timer timer;
-	timer.Mark();
+	Timer totalTime;
+	totalTime.Mark();
 
 	//Create Worker Threads
 	WorkerController workerController; //Initialise Controller
@@ -172,18 +209,33 @@ int Experiment()
 		workerPtrs.push_back(std::make_unique<Worker>(&workerController));
 	}
 
+	std::vector<ChunkTimeInfo> timings;
+	timings.reserve(ChunkCount);
+
+	Timer chunkTimer;
 	for (const auto& chunk : chunks)
 	{
+		chunkTimer.Mark();
 		for (size_t iSubset = 0; iSubset < WorkerCount; iSubset++)
 		{
 			workerPtrs[iSubset]->SetJob(std::span{ &chunk[iSubset * SubsetSize], SubsetSize });
 			//workerThreads.push_back(std::jthread{ ProcessData, std::span{&datasets[j][i], subsetSize}, std::ref(sum[j].i)});
 		}
 		workerController.WaitForAllDone();
+		const auto chunkTime = chunkTimer.Peek();
+
+		timings.push_back({});
+		for (size_t i = 0; i < WorkerCount; i++)
+		{
+			timings.back().numberOfHeavyPerThread[i] = workerPtrs[i]->GetNumHeavy();
+			timings.back().timeSpentWorkingPerThread[i] = workerPtrs[i]->GetJobWorkTime();
+		}
+		timings.back().totalChunkTime = chunkTime;
 	}
 
-	auto t = timer.Peek();
+	auto t = totalTime.Peek();
 	std::cout << "Processing took " << t << " seconds\n";
+
 	unsigned int result = 0;
 	for (const auto& w : workerPtrs)
 	{
@@ -191,16 +243,28 @@ int Experiment()
 	}
 	std::cout << "Result is " << result << std::endl;
 
+	//Output CSV of timings
+	// work-time, idle-time, number of heavies x workers + total time, total heavies
+	std::ofstream csv{ "timings.csv" };
+	for (size_t i = 0; i < WorkerCount; i++)
+	{
+		csv << std::format("work_{0:}, idle_{0:}, heavy_{0:}, ", i);
+	}
+	csv << "chunk_time, total_heavy\n";
 	return 0;
+
+	for (const auto& chunk : timings)
+	{
+		for (size_t i = 0; i < WorkerCount; i++)
+		{
+			csv << std::format("{},{},{},", 
+				chunk.timeSpentWorkingPerThread[i], 
+				chunk.totalChunkTime - chunk.timeSpentWorkingPerThread[i],
+				chunk.numberOfHeavyPerThread[i]);
+		}
+		csv << std::format("{},{}", chunk.totalChunkTime, std::accumulate(std::begin(chunk.numberOfHeavyPerThread), std::end(chunk.numberOfHeavyPerThread), 0));
+	}
 }
-
-
-/*struct Value
-{
-	int i = 0;
-	char padding[60]; //Padding to avoid syncronisation
-};
-Value sum[4];*/
 
 int DoBig()
 {
