@@ -4,13 +4,14 @@
 #include <mutex>
 #include <span>
 #include <format>
+#include <atomic>
 
 #include "Constants.h"
 #include "Task.h"
 #include "Timing.h"
 #include "Timer.h"
 
-namespace que
+namespace atq
 {
 	class WorkerControllerQueued
 	{
@@ -47,10 +48,10 @@ namespace que
 			currentChunk = chunk;
 		}
 
-		const Task* GetTask()
+		_declspec(noinline) const Task* GetTask()
 		{
-			std::lock_guard lock{ mtx };
-			const auto i = idx++;
+			//std::lock_guard lock{ mtx };
+			const auto i = idx.fetch_add(1, std::memory_order_relaxed);
 			if (i >= ChunkSize)
 			{
 				return nullptr;
@@ -65,7 +66,7 @@ namespace que
 		std::span<const Task> currentChunk;
 		//Shared Memory
 		int doneCount = 0;
-		size_t idx = 0;
+		std::atomic<size_t> idx = 0;
 	};
 
 	class WorkerQueued
@@ -171,62 +172,62 @@ namespace que
 
 	int Experiment(Dataset chunks)
 	{
-			Timer totalTime;
-			totalTime.Mark();
+		Timer totalTime;
+		totalTime.Mark();
 
-			//Create Worker Threads
-			WorkerControllerQueued workerController; //Initialise Controller
-			std::vector<std::unique_ptr<WorkerQueued>> workerPtrs(WorkerCount);
-			std::ranges::generate(workerPtrs, [&workerController] {return std::make_unique<WorkerQueued>(&workerController); });
+		//Create Worker Threads
+		WorkerControllerQueued workerController; //Initialise Controller
+		std::vector<std::unique_ptr<WorkerQueued>> workerPtrs(WorkerCount);
+		std::ranges::generate(workerPtrs, [&workerController] {return std::make_unique<WorkerQueued>(&workerController); });
 
-			std::vector<ChunkTimeInfo> timings;
-			timings.reserve(ChunkCount);
+		std::vector<ChunkTimeInfo> timings;
+		timings.reserve(ChunkCount);
 
-			Timer chunkTimer;
-			for (const auto& chunk : chunks)
+		Timer chunkTimer;
+		for (const auto& chunk : chunks)
+		{
+			if constexpr (timingMeasurementEnabled)
 			{
-				if constexpr (timingMeasurementEnabled)
-				{
-					chunkTimer.Mark();
-				}
-
-				workerController.SetChunk(chunk);
-				for (const auto& w : workerPtrs)
-				{
-					w->StartWork();
-					//workerPtrs[iSubset]->SetJob(std::span{ &chunk[iSubset * SubsetSize], SubsetSize });
-					//workerThreads.push_back(std::jthread{ ProcessData, std::span{&datasets[j][i], subsetSize}, std::ref(sum[j].i)});
-				}
-				workerController.WaitForAllDone();
-
-				const auto chunkTime = chunkTimer.Peek();
-
-				if constexpr (timingMeasurementEnabled)
-				{
-					timings.push_back({});
-					for (size_t i = 0; i < WorkerCount; i++)
-					{
-						timings.back().numberOfHeavyPerThread[i] = workerPtrs[i]->GetNumHeavy();
-						timings.back().timeSpentWorkingPerThread[i] = workerPtrs[i]->GetJobWorkTime();
-					}
-					timings.back().totalChunkTime = chunkTime;
-				}
+				chunkTimer.Mark();
 			}
 
-			auto t = totalTime.Peek();
-			std::cout << "Processing took " << t << " seconds\n";
-
-			unsigned int result = 0;
+			workerController.SetChunk(chunk);
 			for (const auto& w : workerPtrs)
 			{
-				result += w->GetResult();
+				w->StartWork();
+				//workerPtrs[iSubset]->SetJob(std::span{ &chunk[iSubset * SubsetSize], SubsetSize });
+				//workerThreads.push_back(std::jthread{ ProcessData, std::span{&datasets[j][i], subsetSize}, std::ref(sum[j].i)});
 			}
-			std::cout << "Result is " << result << std::endl;
+			workerController.WaitForAllDone();
+
+			const auto chunkTime = chunkTimer.Peek();
 
 			if constexpr (timingMeasurementEnabled)
 			{
-				WriteCSV(timings);
+				timings.push_back({});
+				for (size_t i = 0; i < WorkerCount; i++)
+				{
+					timings.back().numberOfHeavyPerThread[i] = workerPtrs[i]->GetNumHeavy();
+					timings.back().timeSpentWorkingPerThread[i] = workerPtrs[i]->GetJobWorkTime();
+				}
+				timings.back().totalChunkTime = chunkTime;
 			}
-			return 0;
+		}
+
+		auto t = totalTime.Peek();
+		std::cout << "Processing took " << t << " seconds\n";
+
+		unsigned int result = 0;
+		for (const auto& w : workerPtrs)
+		{
+			result += w->GetResult();
+		}
+		std::cout << "Result is " << result << std::endl;
+
+		if constexpr (timingMeasurementEnabled)
+		{
+			WriteCSV(timings);
+		}
+		return 0;
 	}
 }

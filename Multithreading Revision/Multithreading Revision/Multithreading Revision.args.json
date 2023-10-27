@@ -1,0 +1,22 @@
+{
+  "FileVersion": 2,
+  "Id": "12f563e6-1edb-45f9-8861-41885b09ab50",
+  "Items": [
+    {
+      "Id": "04d68ef3-11bd-4c5c-b392-3cf3e60d1b2e",
+      "Command": "--atomic-queued"
+    },
+    {
+      "Id": "040f47b9-efa1-4451-8acc-2f26f32156ee",
+      "Command": "--queued"
+    },
+    {
+      "Id": "b931143b-bb8c-429f-9ac0-0ff3c88e8b7e",
+      "Command": "--stacked"
+    },
+    {
+      "Id": "f162fb44-36d5-4099-8f51-21e4e3675e75",
+      "Command": "--even"
+    }
+  ]
+}
