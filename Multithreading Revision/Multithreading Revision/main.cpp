@@ -1,17 +1,9 @@
-#include <iostream>
-#include <vector>
-#include <array>
-#include <random>
-#include <thread>
-#include <mutex>
-#include <span>
-#include <algorithm>
-#include <numeric>
-#include <numbers>
-#include <fstream>
 #include <format>
 #include <functional>
 #include <condition_variable>
+#include <sstream>
+#include <deque>
+#include <algorithm>
 
 #include "Timer.h"
 #include "Constants.h"
@@ -29,63 +21,83 @@ namespace tk
 	class ThreadPool
 	{
 	public:
+		ThreadPool(size_t numWorkers)
+		{
+			workers.reserve(numWorkers);
+			for (size_t i = 0; i < numWorkers; i++)
+			{
+				workers.emplace_back(this);
+			}
+		}
+
 		void Run(Task task)
 		{
-			if (auto i = std::ranges::find_if(workers,[](const auto& w) {return !w->isBusy();});
-			i != workers.end())
 			{
-				(*i)->Run(std::move(task));
+				std::lock_guard lk{ taskQueueMtx_ };
+				tasks_.push_back(std::move(task));
 			}
-			else
-			{
-				workers.push_back(std::make_unique<Worker>());
-				workers.back()->Run(std::move(task));
-			}
-		};
+			taskQueueCV_.notify_one();
+		}
 
-		bool isRunningTasks()
+		void WaitForAllDone()
 		{
-			return std::ranges::any_of(workers, [](const auto& w) {return w->isBusy(); });
-		};
+			std::unique_lock lk{ taskQueueMtx_ };
+			allDoneCV_.wait(lk, [this] {return tasks_.empty(); });
+		}
+
+		~ThreadPool()
+		{
+			for (auto& w : workers)
+			{
+				w.RequestStop();
+			}
+		}
 
 	private:
+		Task GetTask(std::stop_token& st)
+		{
+			Task task;
+			std::unique_lock lk{ taskQueueMtx_ };
+			taskQueueCV_.wait(lk, st, [this] {return !tasks_.empty(); });
+			if (!st.stop_requested())
+			{
+				task = std::move(tasks_.front());
+				tasks_.pop_front();
+				if (tasks_.empty())
+				{
+					allDoneCV_.notify_all();
+				}
+			}
+			return task;
+		}
 
 		class Worker
 		{
 		public:
-			Worker() : thread_(&Worker::RunKernel, this){}
-			bool isBusy() const
+			Worker(ThreadPool* tp) : thread_(std::bind_front(&Worker::RunKernel, this)), pool_{tp} {}
+			void RequestStop()
 			{
-				return busy_;
-			}
-			void Run(Task task)
-			{
-				task_ = std::move(task);
-				busy_ = true;
-				cv.notify_one();
+				thread_.request_stop();
 			}
 		private:
 			//Functions
-			void RunKernel()
+			void RunKernel(std::stop_token st)
 			{
-				std::unique_lock lk{ mtx };
-				auto st = thread_.get_stop_token();
-				while(cv.wait(lk, st, [this]() -> bool {return busy_; }))
+				while(auto task = pool_->GetTask(st))
 				{
-					task_();
-					task_ = {};
-					busy_ = false;
+					task();
 				}
 			}
 
 			//Data
-			std::atomic<bool> busy_ = false;
-			std::condition_variable_any cv;
-			std::mutex mtx;
-			Task task_;
+			ThreadPool* pool_;
 			std::jthread thread_;
 		};
-		std::vector<std::unique_ptr<Worker>> workers;
+		std::mutex taskQueueMtx_;
+		std::condition_variable_any taskQueueCV_;
+		std::condition_variable_any allDoneCV_;
+		std::deque<Task> tasks_;
+		std::vector<Worker> workers;
 	};
 }
 
@@ -127,13 +139,16 @@ int main(int argc, char** argv)
 		return pre::Experiment(std::move(data));
 	}*/
 
-	tk::ThreadPool pool;
-	pool.Run([] {std::cout << "Hel" << std::endl; });
-	pool.Run([] {std::cout << "lo" << std::endl; });
-	while (pool.isRunningTasks())
+	using namespace std::chrono_literals;
+	const auto spit = []
 	{
-		using namespace std::chrono_literals;
-		std::this_thread::sleep_for(16ms);
-	}
+
+		std::ostringstream ss;
+		ss << std::this_thread::get_id();
+		std::cout << std::format("<< {} >>\n", ss.str());
+	};
+
+	tk::ThreadPool pool{ 4 };
+
 	return 0;
 }
