@@ -8,6 +8,7 @@
 #include <semaphore>
 #include <thread>
 #include <assert.h>
+#include <ranges>
 
 #include "Timer.h"
 #include "Constants.h"
@@ -44,6 +45,28 @@ namespace tk
 		std::optional<T> result_;
 	};
 
+	template<>
+	class SharedState<void>
+	{
+	public:
+		void Set()
+		{
+			if (!complete_)
+			{
+				complete_ = true;
+				readySignal_.release();
+			}
+		}
+
+		void Get()
+		{
+			readySignal_.acquire();
+		}
+	private:
+		std::binary_semaphore readySignal_{ 0 }; //Similar to mutex but not tied to thread of execution, acquired on one thread and released on another
+		bool complete_ = false;
+	};
+
 	template<typename T>
 	class Promise;
 
@@ -70,10 +93,10 @@ namespace tk
 	public:
 		Promise() : pState_{ std::make_shared<SharedState<T>>() } {}
 
-		template<typename R>
-		void Set(R&& result)
+		template<typename ...R>
+		void Set(R&&... result)
 		{
-			pState_->Set(std::forward<R>(result));
+			pState_->Set(std::forward<R>(result)...);
 		}
 
 		Future<T> GetFuture()
@@ -131,7 +154,15 @@ namespace tk
 			...args = std::forward<A>(args)
 			]() mutable
 			{
-				promise.Set(function(std::forward<A>(args)...));
+				if constexpr (std::is_void_v<std::invoke_result_t<F, A...>>)
+				{
+					function(std::forward<A>(args)...);
+					promise.Set();
+				}
+				else
+				{
+					promise.Set(function(std::forward<A>(args)...));
+				}
 			};
 		}
 		//Var
@@ -150,13 +181,16 @@ namespace tk
 			}
 		}
 
-		void Run(Task task)
+		template<typename F, typename ...A>
+		auto Run(F&& function, A&& ...args)
 		{
+			auto [task, future] = tk::Task::Make(std::forward<F>(function), std::forward<A>(args)...);
 			{
 				std::lock_guard lk{ taskQueueMtx_ };
 				tasks_.push_back(std::move(task));
 			}
 			taskQueueCV_.notify_one();
+			return future;
 		}
 
 		void WaitForAllDone()
@@ -259,27 +293,40 @@ int main(int argc, char** argv)
 		return pre::Experiment(std::move(data));
 	}*/
 	using namespace std::chrono_literals;
-	/*
-	const auto spit = []
+	
+	const auto spit = [](int milliseconds) -> std::string
 	{
-
+		std::this_thread::sleep_for(1ms * milliseconds);
 		std::ostringstream ss;
 		ss << std::this_thread::get_id();
-		std::cout << std::format("<< {} >>\n", ss.str());
+		return ss.str();
 	};
 
-	tk::ThreadPool pool{ 4 };*/
+	tk::ThreadPool pool{ 4 };
+
+	/*std::vector<tk::Future<std::string>> futures;
+	for (int i = 0; i < 40; i++)
+	{
+		futures.push_back(pool.Run(spit, i * 25));
+	}*/
+
+	auto futures = std::ranges::views::iota(0, 40) |
+		std::ranges::views::transform([&](int i) {return pool.Run(spit, i * 25); }) |
+		std::ranges::to<std::vector>();
+
+	for (auto& f : futures)
+	{
+		std::cout << "<< " << f.Get() << " >>" << std::endl;
+	}
 
 	tk::Promise<int> prom;
 	auto fut = prom.GetFuture();
-
 	std::thread{ [](tk::Promise<int> p)
 		{
 			std::this_thread::sleep_for(2'500ms);
 			p.Set(69);
 		}, std::move(prom)
 	}.detach();
-
 	std::cout << fut.Get();
 
 	auto [task, future] = tk::Task::Make([](int x)
@@ -287,7 +334,6 @@ int main(int argc, char** argv)
 			std::this_thread::sleep_for(1'500ms);
 			return x + 42000;
 		}, 69);
-
 	std::thread{ std::move(task) }.detach();
 	std::cout << future.Get();
 
