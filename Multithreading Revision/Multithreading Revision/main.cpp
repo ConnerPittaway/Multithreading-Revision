@@ -9,6 +9,7 @@
 #include <thread>
 #include <assert.h>
 #include <ranges>
+#include <variant>
 
 #include "Timer.h"
 #include "Constants.h"
@@ -28,7 +29,7 @@ namespace tk
 		template<typename R>
 		void Set(R&& result)
 		{
-			if (!result_)
+			if (std::holds_alternative<std::monostate>(result_))
 			{
 				result_ = std::forward<R>(result);
 				readySignal_.release();
@@ -38,11 +39,26 @@ namespace tk
 		T Get()
 		{
 			readySignal_.acquire();
-			return std::move(*result_);
+			if (auto ppException = std::get_if<std::exception_ptr>(&result_))
+			{
+				std::rethrow_exception(*ppException);
+			}
+			return std::move(std::get<T>(result_));
 		}
+
+		bool Ready()
+		{
+			if (readySignal_.try_acquire())
+			{
+				readySignal_.release();
+				return true;
+			}
+			return false;
+		}
+
 	private:
 		std::binary_semaphore readySignal_{ 0 }; //Similar to mutex but not tied to thread of execution, acquired on one thread and released on another
-		std::optional<T> result_;
+		std::variant<std::monostate, T, std::exception_ptr> result_;
 	};
 
 	template<>
@@ -58,13 +74,39 @@ namespace tk
 			}
 		}
 
+		void Set(std::exception_ptr pException)
+		{
+			if (!complete_)
+			{
+				complete_ = true;
+				pException_ = pException;
+				readySignal_.release();
+			}
+		}
+
 		void Get()
 		{
 			readySignal_.acquire();
+			if (pException_)
+			{
+				std::rethrow_exception(pException_);
+			}
 		}
+
+		bool Ready()
+		{
+			if (readySignal_.try_acquire())
+			{
+				readySignal_.release();
+				return true;
+			}
+			return false;
+		}
+
 	private:
 		std::binary_semaphore readySignal_{ 0 }; //Similar to mutex but not tied to thread of execution, acquired on one thread and released on another
 		bool complete_ = false;
+		std::exception_ptr pException_ = nullptr;
 	};
 
 	template<typename T>
@@ -81,6 +123,12 @@ namespace tk
 			resultAcquired = true;
 			return pState_->Get();
 		}
+
+		bool Ready()
+		{
+			return pState_->Ready();
+		}
+
 	private:
 		Future(std::shared_ptr<SharedState<T>> pState) : pState_{pState}{} //Private so promise (friend class) can only construct futures
 		bool resultAcquired = false;
@@ -154,14 +202,20 @@ namespace tk
 			...args = std::forward<A>(args)
 			]() mutable
 			{
-				if constexpr (std::is_void_v<std::invoke_result_t<F, A...>>)
-				{
-					function(std::forward<A>(args)...);
-					promise.Set();
+				try {
+					if constexpr (std::is_void_v<std::invoke_result_t<F, A...>>)
+					{
+						function(std::forward<A>(args)...);
+						promise.Set();
+					}
+					else
+					{
+						promise.Set(function(std::forward<A>(args)...));
+					}
 				}
-				else
+				catch (...)
 				{
-					promise.Set(function(std::forward<A>(args)...));
+					promise.Set(std::current_exception());
 				}
 			};
 		}
@@ -257,85 +311,73 @@ namespace tk
 
 int main(int argc, char** argv)
 {
-	/*using namespace popl;
-
-	OptionParser op("Allowed options");
-	auto stacked = op.add<Switch>("", "stacked", "Generate a stacked dataset");
-	auto even = op.add<Switch>("", "even", "Generate an even dataset");
-	auto queued = op.add<Switch>("", "queued", "Use task queued approach");
-	auto atomicQueued = op.add<Switch>("", "atomic-queued", "Use atomic queued approach");
-	op.parse(argc, argv);
-
-	Dataset data;
-	if (stacked->is_set())
-	{
-		data = GenerateDataStacked();
-	}
-	else if (even->is_set())
-	{
-		data = GenerateDataEvenly();
-	}
-	else
-	{
-		data = GenerateDataRandom();
-	}
-
-	if (queued->is_set())
-	{
-		return que::Experiment(std::move(data));
-	}
-	else if (atomicQueued->is_set())
-	{
-		return atq::Experiment(std::move(data));
-	}
-	else
-	{
-		return pre::Experiment(std::move(data));
-	}*/
 	using namespace std::chrono_literals;
-	
-	const auto spit = [](int milliseconds) -> std::string
-	{
-		std::this_thread::sleep_for(1ms * milliseconds);
-		std::ostringstream ss;
-		ss << std::this_thread::get_id();
-		return ss.str();
-	};
-
 	tk::ThreadPool pool{ 4 };
 
-	/*std::vector<tk::Future<std::string>> futures;
-	for (int i = 0; i < 40; i++)
+	//Exceptions
 	{
-		futures.push_back(pool.Run(spit, i * 25));
-	}*/
+		const auto spit = [](int milliseconds) -> std::string
+		{
+			if (milliseconds && milliseconds % 100 == 0)
+			{
+				throw::std::runtime_error("ERROR");
+			}
+			std::this_thread::sleep_for(1ms * milliseconds);
+			std::ostringstream ss;
+			ss << std::this_thread::get_id();
+			return ss.str();
+		};
 
-	auto futures = std::ranges::views::iota(0, 40) |
-		std::ranges::views::transform([&](int i) {return pool.Run(spit, i * 25); }) |
-		std::ranges::to<std::vector>();
+		auto futures = std::ranges::views::iota(0, 40) |
+			std::ranges::views::transform([&](int i) {return pool.Run(spit, i * 25); }) |
+			std::ranges::to<std::vector>();
 
-	for (auto& f : futures)
-	{
-		std::cout << "<< " << f.Get() << " >>" << std::endl;
+		for (auto& f : futures)
+		{
+			try {
+				std::cout << "<< " << f.Get() << " >>" << std::endl;
+			}
+			catch (...)
+			{
+				std::cout << "exception caught" << std::endl;
+			}
+		}
 	}
 
-	tk::Promise<int> prom;
-	auto fut = prom.GetFuture();
-	std::thread{ [](tk::Promise<int> p)
-		{
-			std::this_thread::sleep_for(2'500ms);
-			p.Set(69);
-		}, std::move(prom)
-	}.detach();
-	std::cout << fut.Get();
+	//Future from promise
+	{
+		tk::Promise<int> prom;
+		auto fut = prom.GetFuture();
+		std::thread{ [](tk::Promise<int> p)
+			{
+				std::this_thread::sleep_for(2'500ms);
+				p.Set(69);
+			}, std::move(prom)
+		}.detach();
+		std::cout << fut.Get();
+	}
 
-	auto [task, future] = tk::Task::Make([](int x)
+	//Task Creation
+	{
+		auto [task, future] = tk::Task::Make([](int x)
+			{
+				std::this_thread::sleep_for(1'500ms);
+				return x + 42000;
+			}, 69);
+		std::thread{ std::move(task) }.detach();
+		std::cout << future.Get();
+	}
+
+	//Polling
+	{
+		auto future = pool.Run([] {std::this_thread::sleep_for(2000ms); return 69; });
+		while (!future.Ready())
 		{
-			std::this_thread::sleep_for(1'500ms);
-			return x + 42000;
-		}, 69);
-	std::thread{ std::move(task) }.detach();
-	std::cout << future.Get();
+			std::this_thread::sleep_for(250ms);
+			std::cout << "Waiting..." << std::endl;
+		}
+		std::cout << "Task Ready! Value is: " << future.Get() << std::endl;
+	}
 
 	return 0;
 }
